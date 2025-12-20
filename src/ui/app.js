@@ -118,7 +118,10 @@
 
   function renderAccounts(payload) {
     const { count, current, accounts } = payload || {};
-    els.accountsMeta.textContent = `账号数: ${count || 0}；当前索引 claude=${current?.claude ?? 0} / gemini=${current?.gemini ?? 0}`;
+    const total = count || 0;
+    const claudeIndex = total > 0 ? (current?.claude ?? 0) + 1 : 0;
+    const geminiIndex = total > 0 ? (current?.gemini ?? 0) + 1 : 0;
+    els.accountsMeta.textContent = `账号数: ${total}；当前索引 claude=${claudeIndex} / gemini=${geminiIndex}`;
 
     els.accountsBody.innerHTML = "";
     if (!accounts || accounts.length === 0) {

@@ -364,6 +364,10 @@ class AuthManager {
   }
 
   async addAccount(formattedData) {
+    const previousClaudeIndex = this.getCurrentAccountIndex("claude");
+    const previousGeminiIndex = this.getCurrentAccountIndex("gemini");
+    const hadAccountsBefore = this.accounts.length > 0;
+
     // Ensure auth directory exists
     try {
       await fs.access(this.authDir);
@@ -450,8 +454,6 @@ class AuthManager {
     let targetAccount;
     if (existingAccountIndex !== -1) {
       this.accounts[existingAccountIndex].creds = formattedData;
-      this.setCurrentAccountIndex("claude", existingAccountIndex);
-      this.setCurrentAccountIndex("gemini", existingAccountIndex);
       targetAccount = this.accounts[existingAccountIndex];
     } else {
       targetAccount = {
@@ -462,9 +464,22 @@ class AuthManager {
         projectPromise: null,
       };
       this.accounts.push(targetAccount);
-      const newIndex = this.accounts.length - 1;
-      this.setCurrentAccountIndex("claude", newIndex);
-      this.setCurrentAccountIndex("gemini", newIndex);
+    }
+
+    // Adding/updating an account should not implicitly change current selection.
+    // (If this is the first account, default to index 0.)
+    const clampIndex = (idx) => {
+      if (this.accounts.length === 0) return 0;
+      const n = Number.isInteger(idx) ? idx : 0;
+      return Math.max(0, Math.min(n, this.accounts.length - 1));
+    };
+
+    if (!hadAccountsBefore) {
+      this.setCurrentAccountIndex("claude", 0);
+      this.setCurrentAccountIndex("gemini", 0);
+    } else {
+      this.setCurrentAccountIndex("claude", clampIndex(previousClaudeIndex));
+      this.setCurrentAccountIndex("gemini", clampIndex(previousGeminiIndex));
     }
 
     this.tokenRefresher.scheduleRefresh(targetAccount);
