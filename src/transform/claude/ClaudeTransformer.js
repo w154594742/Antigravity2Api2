@@ -72,6 +72,7 @@ class StreamingState {
     this.messageStartSent = false;
     this.messageStopSent = false;
     this.usedTool = false;
+    this.hasThinking = false;
     this.signatures = new SignatureManager();  // thinking/FC 签名
     this.trailingSignature = null;  // 空 text 带签名（必须单独用空 thinking 块承载）
 
@@ -121,6 +122,11 @@ class StreamingState {
       this.endBlock();
     }
     
+    // Claude 官方 SSE：thinking block start 总是带 signature 字段（即便为空串）
+    if (contentBlock?.type === "thinking" && !Object.prototype.hasOwnProperty.call(contentBlock, "signature")) {
+      contentBlock = { ...contentBlock, signature: "" };
+    }
+
     this.emit("content_block_start", {
       type: "content_block_start",
       index: this.blockIndex,
@@ -163,11 +169,14 @@ class StreamingState {
     // 根据官方文档（PDF 776-778 行）：签名可能在空文本 part 上返回
     // trailingSignature 是来自空 text part 的签名，必须用独立的空 thinking 块承载
     // 不能附加到之前的 thinking 块（签名必须在收到它的 part 位置返回）
-    if (this.trailingSignature) {
+    // 注意：Claude Code 在未启用 thinking 时可能不接受 thinking 块。
+    // 当本次响应里没有出现任何 thinking（part.thought=true）时，丢弃 trailingSignature，
+    // 以保持响应结构与官方一致（纯 text/tool_use）。
+    if (this.trailingSignature && this.hasThinking) {
       this.emit("content_block_start", {
         type: "content_block_start",
         index: this.blockIndex,
-        content_block: { type: "thinking", thinking: "" }
+        content_block: { type: "thinking", thinking: "", signature: "" }
       });
       this.emitDelta("thinking_delta", { thinking: "" });
       this.emitDelta("signature_delta", { signature: this.trailingSignature });
@@ -176,6 +185,8 @@ class StreamingState {
         index: this.blockIndex
       });
       this.blockIndex++;
+      this.trailingSignature = null;
+    } else if (this.trailingSignature) {
       this.trailingSignature = null;
     }
     
@@ -227,19 +238,13 @@ class PartProcessor {
       // 修复场景 B4/C3：空 text 带签名后跟 FC
       // 必须先输出空 thinking 块承载 trailingSignature，再处理 FC
       if (this.state.trailingSignature) {
-        this.state.endBlock();  // 关闭当前块
-        this.state.emit("content_block_start", {
-          type: "content_block_start",
-          index: this.state.blockIndex,
-          content_block: { type: "thinking", thinking: "" }
-        });
-        this.state.emitDelta("thinking_delta", { thinking: "" });
-        this.state.emitDelta("signature_delta", { signature: this.state.trailingSignature });
-        this.state.emit("content_block_stop", {
-          type: "content_block_stop",
-          index: this.state.blockIndex
-        });
-        this.state.blockIndex++;
+        // Claude Code 在未启用 thinking 时可能不接受 thinking 块；当本次响应未出现 thinking 时丢弃签名
+        if (this.state.hasThinking) {
+          this.state.startBlock(StreamingState.BLOCK_THINKING, { type: "thinking", thinking: "" });
+          this.state.emitDelta("thinking_delta", { thinking: "" });
+          this.state.emitDelta("signature_delta", { signature: this.state.trailingSignature });
+          this.state.endBlock();
+        }
         this.state.trailingSignature = null;
       }
       this.processFunctionCall(part.functionCall, signature);
@@ -257,23 +262,15 @@ class PartProcessor {
     if (part.text !== undefined) {
       if (part.thought) {
         // thinking 场景
+        this.state.hasThinking = true;
         
         // 修复：如果有 trailingSignature（来自之前的空 text），先输出空 thinking 块
         // 根据规范（PDF 44行）：签名必须在收到它的 part 位置返回
         if (this.state.trailingSignature) {
-          this.state.endBlock();
-          this.state.emit("content_block_start", {
-            type: "content_block_start",
-            index: this.state.blockIndex,
-            content_block: { type: "thinking", thinking: "" }
-          });
+          this.state.startBlock(StreamingState.BLOCK_THINKING, { type: "thinking", thinking: "" });
           this.state.emitDelta("thinking_delta", { thinking: "" });
           this.state.emitDelta("signature_delta", { signature: this.state.trailingSignature });
-          this.state.emit("content_block_stop", {
-            type: "content_block_stop",
-            index: this.state.blockIndex
-          });
-          this.state.blockIndex++;
+          this.state.endBlock();
           this.state.trailingSignature = null;
         }
         
@@ -288,23 +285,23 @@ class PartProcessor {
         // 修复：如果有 trailingSignature（来自之前的空 text），先输出空 thinking 块
         // 根据规范（PDF 44行）：签名必须在收到它的 part 位置返回
         if (this.state.trailingSignature) {
-          this.state.endBlock();
-          this.state.emit("content_block_start", {
-            type: "content_block_start",
-            index: this.state.blockIndex,
-            content_block: { type: "thinking", thinking: "" }
-          });
-          this.state.emitDelta("thinking_delta", { thinking: "" });
-          this.state.emitDelta("signature_delta", { signature: this.state.trailingSignature });
-          this.state.emit("content_block_stop", {
-            type: "content_block_stop",
-            index: this.state.blockIndex
-          });
-          this.state.blockIndex++;
+          // Claude Code 在未启用 thinking 时可能不接受 thinking 块；当本次响应未出现 thinking 时丢弃签名
+          if (this.state.hasThinking) {
+            this.state.startBlock(StreamingState.BLOCK_THINKING, { type: "thinking", thinking: "" });
+            this.state.emitDelta("thinking_delta", { thinking: "" });
+            this.state.emitDelta("signature_delta", { signature: this.state.trailingSignature });
+            this.state.endBlock();
+          }
           this.state.trailingSignature = null;
         }
         
         if (signature) {
+          // Claude Code 在未启用 thinking 时可能不接受 thinking 块；
+          // 对于「text 上的 thoughtSignature」在无 thinking 的响应中直接忽略，保持官方同款结构。
+          if (!this.state.hasThinking) {
+            this.processText(part.text);
+            return;
+          }
           // 根据规范（PDF 行44）：非空 text 带签名必须立即处理，不能合并到当前 text 块
           // 1. 先关闭当前块
           this.state.endBlock();
@@ -317,7 +314,7 @@ class PartProcessor {
           this.state.emit("content_block_start", {
             type: "content_block_start",
             index: this.state.blockIndex,
-            content_block: { type: "thinking", thinking: "" }
+            content_block: { type: "thinking", thinking: "", signature: "" }
           });
           this.state.emitDelta("thinking_delta", { thinking: "" });
           this.state.emitDelta("signature_delta", { signature });
@@ -396,6 +393,7 @@ class NonStreamingProcessor {
     this.textBuilder = "";
     this.thinkingBuilder = "";
     this.hasToolCall = false;
+    this.hasThinking = false;
     // 分离两种签名来源：
     // thinkingSignature: 来自 thought=true 的 part，随 thinking 块输出
     // trailingSignature: 来自空普通文本的 part，在 process() 末尾用空 thinking 块承载
@@ -405,6 +403,9 @@ class NonStreamingProcessor {
   
   process() {
     const parts = this.raw.candidates?.[0]?.content?.parts || [];
+
+    // 非流式可一次性预扫，确保“本次响应是否启用 thinking”判断不会被顺序影响
+    this.hasThinking = parts.some((p) => p?.thought);
     
     for (const part of parts) {
       this.processPart(part);
@@ -416,12 +417,16 @@ class NonStreamingProcessor {
     
     // 处理空普通文本带签名的场景（PDF 776-778）
     // 签名在最后一个 part，但那是空文本，需要输出空 thinking 块承载签名
-    if (this.trailingSignature) {
+    // 注意：当本次响应完全没有 thinking（part.thought=true）时，丢弃 trailingSignature，
+    // 避免在非 thinking 模式下返回额外的 thinking 块（Claude Code 兼容性）。
+    if (this.trailingSignature && this.hasThinking) {
       this.contentBlocks.push({
         type: "thinking",
         thinking: "",
         signature: this.trailingSignature
       });
+      this.trailingSignature = null;
+    } else if (this.trailingSignature) {
       this.trailingSignature = null;
     }
     
@@ -441,11 +446,14 @@ class NonStreamingProcessor {
       // 修复场景 B4/C3：空 text 带签名后跟 FC（Gemini 2.5 风格）
       // 必须先输出空 thinking 块承载 trailingSignature，再处理 FC
       if (this.trailingSignature) {
-        this.contentBlocks.push({
-          type: "thinking",
-          thinking: "",
-          signature: this.trailingSignature
-        });
+        // Claude Code 在未启用 thinking 时可能不接受 thinking 块；当本次响应未出现 thinking 时丢弃签名
+        if (this.hasThinking) {
+          this.contentBlocks.push({
+            type: "thinking",
+            thinking: "",
+            signature: this.trailingSignature,
+          });
+        }
         this.trailingSignature = null;
       }
       
@@ -480,11 +488,13 @@ class NonStreamingProcessor {
         // 根据规范（PDF 44行）：签名必须在收到它的 part 位置返回
         if (this.trailingSignature) {
           this.flushThinking();  // 先刷新之前累积的 thinking
-          this.contentBlocks.push({
-            type: "thinking",
-            thinking: "",
-            signature: this.trailingSignature
-          });
+          if (this.hasThinking) {
+            this.contentBlocks.push({
+              type: "thinking",
+              thinking: "",
+              signature: this.trailingSignature,
+            });
+          }
           this.trailingSignature = null;
         }
         
@@ -511,18 +521,22 @@ class NonStreamingProcessor {
         // 根据规范（PDF 44行）：签名必须在收到它的 part 位置返回
         if (this.trailingSignature) {
           this.flushText();  // 先刷新之前累积的 text
-          this.contentBlocks.push({
-            type: "thinking",
-            thinking: "",
-            signature: this.trailingSignature
-          });
+          // Claude Code 在未启用 thinking 时可能不接受 thinking 块；当本次响应未出现 thinking 时丢弃签名
+          if (this.hasThinking) {
+            this.contentBlocks.push({
+              type: "thinking",
+              thinking: "",
+              signature: this.trailingSignature,
+            });
+          }
           this.trailingSignature = null;
         }
         
         this.textBuilder += part.text;
         
-        // 非空 text 带签名时，立即刷新 text 并输出空 thinking 块承载签名
-        if (signature) {
+        // 非空 text 带签名：仅在本次响应里出现过 thinking 时才输出空 thinking 块承载签名；
+        // 否则丢弃该签名，保持响应结构与官方一致（纯 text/tool_use）。
+        if (signature && this.hasThinking) {
           this.flushText();
           this.contentBlocks.push({
             type: "thinking",
