@@ -831,6 +831,10 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
 
   // 2. Contents (Messages)
   const contents = [];
+  // Claude Code / 部分客户端会在每次 tool_result 后重复附带同一句“任务指令”文本。
+  // 这通常只是上下文回显，并非新指令；为避免上游模型每轮都被重复文本误导，这里做一次轻量去重：
+  // - 仅在「tool_result 后紧跟的 text」与上一轮用户任务文本完全一致（忽略空白）时跳过该 text。
+  let lastUserTaskTextNormalized = null;
   if (claudeReq.messages) {
     for (let msgIndex = 0; msgIndex < claudeReq.messages.length; msgIndex++) {
       const msg = claudeReq.messages[msgIndex];
@@ -847,14 +851,27 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
       // thinking block after any non-thinking content (text/tool/image/etc), drop it to avoid invalid
       // thought parts (and leaking late "thinking" as plain text).
       let sawNonThinkingContent = false;
+      let previousWasToolResult = false;
       
       if (Array.isArray(msg.content)) {
         for (const item of msg.content) {
           if (item.type === "text") {
             const text = typeof item.text === "string" ? item.text : "";
             if (!text || text === "(no content)") continue;
+            if (
+              role === "user" &&
+              previousWasToolResult &&
+              lastUserTaskTextNormalized &&
+              text.replace(/\s+/g, "") === lastUserTaskTextNormalized
+            ) {
+              // Skip duplicated task text echoed after tool_result.
+              previousWasToolResult = false;
+              continue;
+            }
             clientContent.parts.push({ text });
             sawNonThinkingContent = true;
+            previousWasToolResult = false;
+            if (role === "user") lastUserTaskTextNormalized = text.replace(/\s+/g, "");
           } else if (item.type === "thinking") {
             // 根据官方文档：签名必须在收到签名的那个 part 上原样返回
             // 重要：我们在 response 侧会用一个空的 Claude "thinking" block 来承载“空 text part 的 thoughtSignature”（Claude text 不支持 signature）。
@@ -895,6 +912,7 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               clientContent.parts.push({ text: thinkingText });
               sawNonThinkingContent = true;
             }
+            previousWasToolResult = false;
           } else if (item.type === "redacted_thinking") {
             const text = typeof item.data === "string" ? item.data : "";
             if (!text) continue;
@@ -902,6 +920,7 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
             // redacted_thinking 同样可能没有签名，按普通文本降级，避免上游签名校验报错
             clientContent.parts.push({ text });
             sawNonThinkingContent = true;
+            previousWasToolResult = false;
           } else if (item.type === "image") {
             // Handle image
             const source = item.source || {};
@@ -914,6 +933,7 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               });
               sawNonThinkingContent = true;
             }
+            previousWasToolResult = false;
           } else if (item.type === "tool_use") {
             // 根据官方文档：签名必须在收到签名的那个 functionCall part 上原样返回
             const fcPart = {
@@ -937,6 +957,7 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
             }
             clientContent.parts.push(fcPart);
             sawNonThinkingContent = true;
+            previousWasToolResult = false;
           } else if (item.type === "tool_result") {
             // 优先用先前记录的 tool_use id -> name 映射，还原原始函数名
             let funcName = toolIdToName.get(item.tool_use_id) || item.tool_use_id;
@@ -954,11 +975,15 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               },
             });
             sawNonThinkingContent = true;
+            previousWasToolResult = true;
           }
         }
       } else if (typeof msg.content === "string") {
         const text = msg.content;
-        if (text) clientContent.parts.push({ text });
+        if (text) {
+          clientContent.parts.push({ text });
+          if (role === "user") lastUserTaskTextNormalized = String(text).replace(/\s+/g, "");
+        }
       }
       
       if (clientContent.parts.length > 0) {
