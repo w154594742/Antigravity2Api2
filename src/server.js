@@ -140,7 +140,8 @@ function isCombiningMark(codePoint = 0) {
 /**
  * Calculate printable width contribution for a single code point.
  */
-function getCodePointWidth(codePoint = 0) {
+function getCodePointWidth(codePoint) {
+  if (!Number.isFinite(codePoint)) return 0;
   if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) return 0;
   if (ZERO_WIDTH_CODEPOINTS.has(codePoint)) return 0;
   if (isCombiningMark(codePoint)) return 0;
@@ -165,7 +166,10 @@ function getDisplayWidth(input = "") {
 
 /**
  * Truncate a string to a target display width using an ellipsis prefix while
- * preserving the end of the string (e.g., a file path).
+ * preserving the end of the string (e.g., a file path). The default
+ * maxWidth of 40 is intended for constrained display areas (such as the
+ * startup banner); callers should pass a larger maxWidth when more space
+ * is available.
  */
 function truncateDisplayWidth(input = "", maxWidth = 40, ellipsis = "...") {
   const text = stripAnsi(String(input));
@@ -174,12 +178,17 @@ function truncateDisplayWidth(input = "", maxWidth = 40, ellipsis = "...") {
   const ellipsisWidth = getDisplayWidth(ellipsis);
   const targetWidth = Math.max(0, maxWidth - ellipsisWidth);
 
+  const graphemes = typeof Intl !== "undefined" && Intl.Segmenter
+    ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (s) => s.segment)
+    : [...text];
+
   let suffixWidth = 0;
   let suffix = "";
-  for (const char of [...text].reverse()) {
-    const width = getCodePointWidth(char.codePointAt(0));
+  for (let i = graphemes.length - 1; i >= 0; i--) {
+    const chunk = graphemes[i];
+    const width = getDisplayWidth(chunk);
     if (suffixWidth + width > targetWidth) break;
-    suffix = char + suffix;
+    suffix = chunk + suffix;
     suffixWidth += width;
   }
 
@@ -398,6 +407,8 @@ const server = http.createServer(async (req, res) => {
     const formatBoxLine = (text = "") => {
       const visibleWidth = getDisplayWidth(text);
       const padding = Math.max(0, innerWidth - visibleWidth - 2);
+      // NOTE: Padding assumes the terminal's Unicode display width matches getDisplayWidth.
+      // Certain emoji in some terminals may render wider and cause minor visual offsets.
       return `${Colors.green}${Box.vertical}${Colors.reset} ${text}${" ".repeat(padding)} ${Colors.green}${Box.vertical}${Colors.reset}`;
     };
     
